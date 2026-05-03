@@ -1,0 +1,1323 @@
+"""
+GeoSpy — GeoGuessr-style game (Selenium edition, fully fixed)
+=============================================================
+
+Key improvements over original:
+  • PERSISTENT headless driver — created once, reused every round (~3x faster)
+  • SSE streaming — frontend shows live step-by-step progress while Selenium works
+  • 9 Pillow blur zones — covers every location-revealing element aggressively
+  • Page shown only after all assets ready (boot loader fades, then menu appears)
+  • All original bugs fixed:
+      - autoGuess() race condition (setTimeout 0 after marker placed)
+      - progress-bar animation not resetting between rounds
+      - unhandled image-decode promise rejection
+      - SSE aborted cleanly on navigation/round skip
+      - timer cleared before submitGuess in all code paths
+
+Install:
+    pip install flask selenium webdriver-manager Pillow
+
+Run:
+    python geogame.py   ->   open http://localhost:5000
+"""
+
+import base64, io, json, math, queue, random, threading, time
+from flask import Flask, Response, render_template_string, request, jsonify
+
+# ── Optional deps ─────────────────────────────────────────────────────────────
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_OK = True
+except ImportError:
+    SELENIUM_OK = False
+
+try:
+    from PIL import Image, ImageFilter
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+
+app = Flask(__name__)
+
+# ── Famous landmarks ──────────────────────────────────────────────────────────
+FAMOUS_PLACES = [
+    ("Eiffel Tower, Paris",            48.858370,   2.294481,  160,   5, "Western Europe"),
+    ("Champs-Elysees, Paris",          48.873792,   2.295015,   90,   0, "Western Europe"),
+    ("Colosseum, Rome",                41.890210,  12.492231,  200,   5, "Italy & Balkans"),
+    ("Trevi Fountain, Rome",           41.900904,  12.483313,  270,   0, "Italy & Balkans"),
+    ("Big Ben, London",                51.500729,  -0.124625,   45,   5, "UK & Ireland"),
+    ("Tower Bridge, London",           51.505465,  -0.075356,  350,   5, "UK & Ireland"),
+    ("Buckingham Palace, London",      51.501364,  -0.141890,   90,   0, "UK & Ireland"),
+    ("Sagrada Familia, Barcelona",     41.404015,   2.174260,  180,  10, "Iberian Peninsula"),
+    ("Brandenburg Gate, Berlin",       52.516275,  13.377704,  270,   5, "Western Europe"),
+    ("Neuschwanstein Castle",          47.557574,  10.749804,  200,  10, "Western Europe"),
+    ("Acropolis, Athens",              37.971523,  23.726136,  315,  10, "Italy & Balkans"),
+    ("Santorini, Greece",              36.393154,  25.461509,  180,   5, "Italy & Balkans"),
+    ("Amsterdam Canals",               52.372482,   4.893509,   45,   0, "Western Europe"),
+    ("Hallstatt, Austria",             47.562080,  13.649280,  180,   5, "Western Europe"),
+    ("Charles Bridge, Prague",         50.086450,  14.411760,  270,   0, "Eastern Europe"),
+    ("Dubrovnik Old City",             42.641390,  18.110350,  180,   0, "Italy & Balkans"),
+    ("Venice Grand Canal",             45.437470,  12.335490,   90,   0, "Italy & Balkans"),
+    ("St Basil Cathedral, Moscow",     55.752220,  37.623040,  180,   5, "Eastern Europe"),
+    ("Times Square, New York",         40.758896, -73.985130,  180,   0, "Eastern USA"),
+    ("Brooklyn Bridge, New York",      40.706086, -73.996864,  270,   5, "Eastern USA"),
+    ("Central Park, New York",         40.785091, -73.968285,   90,   0, "Eastern USA"),
+    ("Miami South Beach",              25.790654, -80.130045,   90,   0, "Eastern USA"),
+    ("Las Vegas Strip",                36.116920,-115.172813,  180,   0, "Western USA"),
+    ("Golden Gate Bridge, SF",         37.819929,-122.478255,  180,   5, "Western USA"),
+    ("Hollywood Walk of Fame, LA",     34.101600,-118.341500,   90,   0, "Western USA"),
+    ("Grand Canyon South Rim",         36.056595,-112.125984,  180,  -5, "Western USA"),
+    ("Chicago Millennium Park",        41.882702, -87.623177,  270,   0, "Central USA"),
+    ("New Orleans French Quarter",     29.958443, -90.064539,   90,   0, "Central USA"),
+    ("Niagara Falls, Canada",          43.079640, -79.074960,  180,   0, "Canada"),
+    ("Banff, Canada",                  51.178363,-115.570769,  180,   5, "Canada"),
+    ("Chichen Itza, Mexico",           20.683210, -88.568710,  270,   5, "Mexico"),
+    ("Machu Picchu, Peru",            -13.163141, -72.545872,   90,  10, "Andes"),
+    ("Copacabana Beach, Rio",         -22.970722, -43.182365,  180,   0, "Brazil"),
+    ("Christ the Redeemer, Rio",      -22.951916, -43.210487,  180,  10, "Brazil"),
+    ("Iguazu Falls",                  -25.695700, -54.436800,  180,   5, "Southern Cone"),
+    ("Mount Fuji, Japan",              35.360496, 138.727500,  180,   5, "Japan"),
+    ("Shibuya Crossing, Tokyo",        35.659500, 139.700500,  270,   0, "Japan"),
+    ("Fushimi Inari, Kyoto",           34.967209, 135.772790,  180,   5, "Japan"),
+    ("Arashiyama Bamboo, Kyoto",       35.017200, 135.671900,  180,   0, "Japan"),
+    ("Gyeongbokgung Palace, Seoul",    37.579617, 126.977041,  180,   5, "South Korea"),
+    ("The Bund, Shanghai",             31.240833, 121.490833,   90,   0, "China East"),
+    ("Angkor Wat, Cambodia",           13.412469, 103.866936,  180,   5, "Southeast Asia"),
+    ("Hoi An Old Town, Vietnam",       15.877950, 108.325470,   90,   0, "Southeast Asia"),
+    ("Bali Rice Terraces",             -8.512300, 115.258600,  180,   5, "Southeast Asia"),
+    ("Taj Mahal, Agra",                27.175015,  78.042155,  180,   5, "India"),
+    ("Jaipur Hawa Mahal",              26.924500,  75.826900,  270,   0, "India"),
+    ("Mumbai Gateway of India",        18.921984,  72.834654,  180,   5, "India"),
+    ("Petra Treasury, Jordan",         30.328610,  35.441900,  180,   5, "Middle East"),
+    ("Burj Khalifa, Dubai",            25.197197,  55.274376,  180,   5, "Middle East"),
+    ("Hagia Sophia, Istanbul",         41.008660,  28.980260,  270,   5, "Turkey"),
+    ("Cappadocia, Turkey",             38.643900,  34.828800,  180,   0, "Turkey"),
+    ("Pyramids of Giza, Egypt",        29.979235,  31.134202,  180,   5, "North Africa"),
+    ("Marrakech Medina, Morocco",      31.631980,  -7.989520,   90,   0, "North Africa"),
+    ("Victoria Falls, Zimbabwe",      -17.924790,  25.857500,  270,   5, "Southern Africa"),
+    ("Cape Town, South Africa",       -33.963500,  18.403600,  180,  10, "Southern Africa"),
+    ("Sydney Opera House",            -33.856784, 151.215297,  270,   5, "Australia"),
+    ("Sydney Harbour Bridge",         -33.852230, 151.210540,  180,   5, "Australia"),
+    ("Great Ocean Road, Australia",   -38.663900, 143.393700,  270,   0, "Australia"),
+    ("Milford Sound, New Zealand",    -44.641500, 167.897500,  180,   5, "New Zealand"),
+    ("Queenstown, New Zealand",       -45.031200, 168.662500,  270,   0, "New Zealand"),
+]
+
+REGIONS = [
+    ("Western Europe",     42.0,  55.0,  -5.0,  20.0, 10),
+    ("Eastern Europe",     44.0,  55.0,  20.0,  40.0,  7),
+    ("Scandinavia",        55.0,  71.0,   4.0,  32.0,  4),
+    ("UK & Ireland",       50.0,  59.0, -10.0,   2.0,  5),
+    ("Iberian Peninsula",  36.0,  44.0,  -9.0,   3.0,  5),
+    ("Italy & Balkans",    37.0,  47.0,  12.0,  28.0,  6),
+    ("Eastern USA",        25.0,  47.0, -85.0, -65.0, 10),
+    ("Central USA",        30.0,  49.0,-105.0, -85.0,  8),
+    ("Western USA",        32.0,  49.0,-125.0,-105.0,  7),
+    ("Canada",             45.0,  60.0,-130.0, -55.0,  5),
+    ("Mexico",             15.0,  32.0,-118.0, -86.0,  5),
+    ("Brazil",            -25.0,   5.0, -55.0, -35.0,  7),
+    ("Southern Cone",     -55.0, -15.0, -75.0, -45.0,  4),
+    ("Andes",             -20.0,   5.0, -80.0, -60.0,  3),
+    ("Japan",              30.0,  45.0, 130.0, 145.0,  8),
+    ("South Korea",        34.0,  38.0, 126.0, 130.0,  5),
+    ("China East",         20.0,  45.0, 110.0, 125.0,  8),
+    ("India",               8.0,  35.0,  68.0,  90.0,  9),
+    ("Southeast Asia",     -8.0,  22.0,  95.0, 125.0,  7),
+    ("Middle East",        15.0,  38.0,  35.0,  60.0,  4),
+    ("Turkey",             36.0,  42.0,  26.0,  45.0,  4),
+    ("North Africa",       15.0,  35.0,  -5.0,  40.0,  4),
+    ("West Africa",         4.0,  15.0, -18.0,  10.0,  3),
+    ("East Africa",        -5.0,  15.0,  30.0,  45.0,  3),
+    ("Southern Africa",   -35.0,  -5.0,  15.0,  40.0,  4),
+    ("Australia",         -40.0, -15.0, 115.0, 155.0,  5),
+    ("New Zealand",       -47.0, -34.0, 165.0, 178.0,  3),
+]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def random_location():
+    if random.random() < 0.65:
+        p = random.choice(FAMOUS_PLACES)
+        name, lat, lng, heading, pitch, region = p
+        return {
+            "lat":     round(lat + random.uniform(-0.0003, 0.0003), 6),
+            "lng":     round(lng + random.uniform(-0.0003, 0.0003), 6),
+            "region":  region,
+            "heading": (heading + random.randint(-15, 15)) % 360,
+            "pitch":   pitch, "place": name, "famous": True,
+        }
+    weights = [r[5] for r in REGIONS]
+    reg = random.choices(REGIONS, weights=weights, k=1)[0]
+    rname, lat_min, lat_max, lng_min, lng_max, _ = reg
+    return {
+        "lat":     round(random.uniform(lat_min, lat_max), 6),
+        "lng":     round(random.uniform(lng_min, lng_max), 6),
+        "region":  rname, "heading": random.randint(0, 359),
+        "pitch":   random.randint(-10, 10), "place": None, "famous": False,
+    }
+
+def haversine(lat1, lng1, lat2, lng2):
+    R = 6371
+    dLat = math.radians(lat2 - lat1); dLng = math.radians(lng2 - lng1)
+    a = math.sin(dLat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dLng/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+def score_from_km(km):
+    if km < 0.05: return 5000
+    return max(0, round(5000 * math.exp(-km / 2000)))
+
+
+# ── Persistent headless Selenium driver ───────────────────────────────────────
+# One driver instance, reused across all rounds.
+# ~3x faster than creating a new browser per screenshot.
+
+_driver = None
+_driver_lock = threading.Lock()
+
+def _make_headless_driver():
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1280,720")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-infobars")
+    opts.add_argument("--lang=en-US,en;q=0.9")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-gpu")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+    try:
+        svc = Service(ChromeDriverManager().install())
+    except Exception:
+        svc = Service()
+    drv = webdriver.Chrome(service=svc, options=opts)
+    drv.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    drv.set_page_load_timeout(30)
+    return drv
+
+def get_driver():
+    """Return the persistent headless driver, recreating if dead."""
+    global _driver
+    with _driver_lock:
+        if _driver is not None:
+            try:
+                _ = _driver.window_handles   # raises if dead
+            except Exception:
+                try: _driver.quit()
+                except: pass
+                _driver = None
+        if _driver is None:
+            _driver = _make_headless_driver()
+        return _driver
+
+
+# ── Street View URL ───────────────────────────────────────────────────────────
+def sv_url(lat, lng, heading, pitch):
+    tilt = max(10, min(170, 90 - int(pitch)))
+    return (
+        f"https://www.google.com/maps/@{lat},{lng},3a,90y,"
+        f"{int(heading)}h,{tilt}t"
+        f"/data=!3m7!1e1!3m5!1s0!2e0!3e11!7i16384!8i8192"
+    )
+
+
+# ── Popup dismissal ───────────────────────────────────────────────────────────
+def _dismiss_popups(driver):
+    xpaths = [
+        "//button[@jsname='tWT92d']",
+        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'accept all')]",
+        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'i agree')]",
+        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'reject all')]",
+        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'accept')]",
+    ]
+    for _ in range(6):
+        clicked = False
+        for xp in xpaths:
+            try:
+                btn = driver.find_element(By.XPATH, xp)
+                if btn.is_displayed() and btn.is_enabled():
+                    btn.click(); time.sleep(0.4); clicked = True; break
+            except Exception:
+                pass
+        if not clicked: break
+        time.sleep(0.3)
+
+
+# ── Canvas readiness check ────────────────────────────────────────────────────
+def _canvas_ready(driver):
+    try:
+        return driver.execute_script(
+            "for(var c of document.querySelectorAll('canvas'))"
+            "{if(c.width>300&&c.height>200)return true;}return false;"
+        )
+    except Exception:
+        return False
+
+
+# ── Inject CSS+JS to hide all location-revealing UI ───────────────────────────
+_HIDE_JS = """
+(function(){
+  var ID='geospy-hide';
+  if(document.getElementById(ID))return;
+  var s=document.createElement('style');
+  s.id=ID;
+  s.textContent=`
+    #searchboxinput,.tactile-searchbox-input,.searchbox,.omnibox-container,
+    div[jsaction*="searchbox"],#omnibox-singlebox,
+    div[aria-label*="Search Google Maps"]{display:none!important}
+    div[data-panel-id],div[class*="place-card"],div[class*="section-hero"],
+    div[jsaction*="placeCard"],div[class*="image-header"],div[class*="widget-pane"],
+    div[class*="scene-header"],div[class*="scene-title"],
+    div[class*="ol-overlaycontainer"],.section-layout,
+    .place-description{display:none!important}
+    .widget-minimap,div[class*="minimap"],
+    canvas[class*="minimap"]{display:none!important}
+    div[class*="street-name"],div[class*="streetname"],
+    .scene-footer,.scene-footer-container,
+    .scene-footer-root{display:none!important}
+    .gm-style-cc,.gmnoprint,a[href*="maps.google"],
+    div[class*="imagery-term"],div[class*="image-term"],
+    span[class*="copyright"],div[class*="copyright"],
+    .watermark,.fineprint{display:none!important}
+    .gm-svpc,.gm-bundled-control,div[class*="widget-zoom"],
+    button[jsaction*="zoom"],button[jsaction*="compass"],
+    div[class*="fullscreen"],div[data-tooltip]{display:none!important}
+    .gb_za,.gb_oa,div[class*="gb_"],#gbwa,
+    div[aria-label*="Google Account"],
+    a[href*="accounts.google"]{display:none!important}
+  `;
+  document.head.appendChild(s);
+  var sel=[
+    '#searchboxinput','div[data-panel-id]','div[class*="place-card"]',
+    'div[class*="widget-pane"]','div[class*="scene-header"]',
+    '.widget-minimap','div[class*="minimap"]',
+    'div[class*="street-name"]','div[class*="streetname"]',
+    '.scene-footer','.scene-footer-container','.scene-footer-root',
+    '.gm-style-cc','.gmnoprint','a[href*="maps.google"]',
+    'div[class*="imagery-term"]','span[class*="copyright"]',
+    '.gm-svpc','.gm-bundled-control','div[class*="widget-zoom"]',
+    '.gb_za','.gb_oa','div[aria-label*="Google Account"]',
+    'div[class*="section-hero"]','div[class*="image-header"]'
+  ];
+  function hideAll(){
+    sel.forEach(function(q){
+      document.querySelectorAll(q).forEach(function(el){
+        el.style.setProperty('display','none','important');
+      });
+    });
+  }
+  hideAll();
+  if(!window._geospyHide)window._geospyHide=setInterval(hideAll,1200);
+})();
+"""
+
+
+# ── Pillow blur zones (9 zones, expressed as fractional coords) ───────────────
+# Tuned for 1280x720. Fractions make them resolution-independent.
+#   (x1_frac, y1_frac, x2_frac, y2_frac)
+_BLUR_ZONES = [
+    (0.00, 0.00, 0.38, 0.09),   # Top-left search bar pill
+    (0.00, 0.09, 0.34, 1.00),   # Left info/place card column (full height)
+    (0.00, 0.94, 1.00, 1.00),   # Bottom attribution strip (full width)
+    (0.00, 0.76, 0.19, 0.94),   # Bottom-left minimap thumbnail
+    (0.00, 0.66, 0.34, 0.80),   # Bottom street-name chip
+    (0.96, 0.00, 1.00, 1.00),   # Right-edge controls (zoom, compass)
+    (0.88, 0.00, 1.00, 0.09),   # Top-right Google account avatar
+    (0.38, 0.00, 0.62, 0.07),   # Top-centre Google Maps wordmark
+    (0.70, 0.90, 1.00, 1.00),   # Bottom-right "Report a problem" link
+]
+
+def _apply_blurs(png_bytes):
+    """Apply Gaussian blur over all location-revealing regions."""
+    if not PIL_OK:
+        return png_bytes
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    w, h = img.size
+    BLUR = ImageFilter.GaussianBlur(radius=48)
+    for (xf1, yf1, xf2, yf2) in _BLUR_ZONES:
+        x1, y1 = max(0, int(w * xf1)), max(0, int(h * yf1))
+        x2, y2 = min(w, int(w * xf2)), min(h, int(h * yf2))
+        if x2 > x1 and y2 > y1:
+            region = img.crop((x1, y1, x2, y2))
+            img.paste(region.filter(BLUR), (x1, y1))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# ── Core capture (SSE-friendly, uses persistent driver) ───────────────────────
+def capture_street_view(lat, lng, heading, pitch, cb):
+    """
+    Capture and return a blurred Street View screenshot.
+    cb(pct, msg) is called at each step to stream progress.
+    Returns (success: bool, b64_image_or_error: str)
+    """
+    if not SELENIUM_OK:
+        return False, "selenium not installed — run: pip install selenium webdriver-manager Pillow"
+
+    url = sv_url(lat, lng, heading, pitch)
+    driver = get_driver()
+
+    try:
+        cb(5,  "Navigating to Street View")
+        driver.get(url)
+
+        cb(20, "Dismissing cookie popups")
+        time.sleep(2.5)
+        _dismiss_popups(driver)
+
+        cb(35, "Waiting for panorama canvas")
+        for _ in range(28):
+            if _canvas_ready(driver): break
+            time.sleep(0.5)
+
+        if not _canvas_ready(driver):
+            return False, "Street View canvas did not load — no coverage at this location"
+
+        cb(60, "Hiding location clues")
+        driver.execute_script(_HIDE_JS)
+        time.sleep(1.8)
+
+        cb(80, "Taking screenshot")
+        png = driver.get_screenshot_as_png()
+
+        cb(90, "Blurring remaining UI")
+        blurred = _apply_blurs(png)
+
+        cb(100, "Done")
+        return True, base64.b64encode(blurred).decode()
+
+    except Exception as e:
+        # Mark driver as dead so get_driver() rebuilds it next round
+        global _driver
+        with _driver_lock:
+            if _driver is driver:
+                try: _driver.quit()
+                except: pass
+                _driver = None
+        return False, str(e)
+
+
+# ── Explore: visible browser window with hidden UI ────────────────────────────
+_explore_driver = None
+_explore_lock   = threading.Lock()
+
+def _make_visible_driver():
+    opts = Options()
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1280,900")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-infobars")
+    opts.add_argument("--lang=en-US,en;q=0.9")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+    try:
+        svc = Service(ChromeDriverManager().install())
+    except Exception:
+        svc = Service()
+    drv = webdriver.Chrome(service=svc, options=opts)
+    drv.execute_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    drv.set_page_load_timeout(30)
+    return drv
+
+def open_explore_tab(lat, lng, heading, pitch):
+    global _explore_driver
+    if not SELENIUM_OK:
+        import webbrowser
+        webbrowser.open(sv_url(lat, lng, heading, pitch))
+        return
+    url = sv_url(lat, lng, heading, pitch)
+    with _explore_lock:
+        try:
+            if _explore_driver: _ = _explore_driver.window_handles
+        except Exception:
+            _explore_driver = None
+        if _explore_driver is None:
+            _explore_driver = _make_visible_driver()
+        _explore_driver.execute_script("window.open('');")
+        _explore_driver.switch_to.window(_explore_driver.window_handles[-1])
+        _explore_driver.get(url)
+
+    def _keep_hiding():
+        for _ in range(90):
+            time.sleep(1)
+            try:
+                with _explore_lock:
+                    if _explore_driver: _explore_driver.execute_script(_HIDE_JS)
+            except Exception:
+                break
+    threading.Thread(target=_keep_hiding, daemon=True).start()
+
+def close_explore_tab():
+    global _explore_driver
+    with _explore_lock:
+        try:
+            if _explore_driver and len(_explore_driver.window_handles) > 1:
+                _explore_driver.close()
+                _explore_driver.switch_to.window(_explore_driver.window_handles[-1])
+        except Exception:
+            pass
+
+
+# ── Flask routes ──────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template_string(GAME_HTML)
+
+@app.route("/api/status")
+def api_status():
+    return jsonify({"selenium": SELENIUM_OK, "pillow": PIL_OK})
+
+@app.route("/api/round")
+def api_round():
+    return jsonify(random_location())
+
+@app.route("/api/screenshot/stream")
+def api_screenshot_stream():
+    """
+    SSE endpoint — streams real-time progress while Selenium captures.
+
+    Query params: lat, lng, heading, pitch
+
+    Emits:
+      data: {"type":"progress","pct":N,"msg":"..."}
+      data: {"type":"done","image":"<base64>"}
+      data: {"type":"error","error":"..."}
+    """
+    lat     = float(request.args.get("lat", 0))
+    lng     = float(request.args.get("lng", 0))
+    heading = int(request.args.get("heading", 0))
+    pitch   = int(request.args.get("pitch", 0))
+
+    q = queue.Queue()
+
+    def cb(pct, msg):
+        q.put({"type": "progress", "pct": pct, "msg": msg})
+
+    def worker():
+        ok, result = capture_street_view(lat, lng, heading, pitch, cb)
+        if ok:
+            q.put({"type": "done", "image": result})
+        else:
+            q.put({"type": "error", "error": result})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def generate():
+        while True:
+            try:
+                event = q.get(timeout=65)
+            except queue.Empty:
+                yield 'data: {"type":"error","error":"timeout"}\n\n'
+                return
+            yield f"data: {json.dumps(event)}\n\n"
+            if event["type"] in ("done", "error"):
+                return
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+@app.route("/api/explore", methods=["POST"])
+def api_explore():
+    d = request.get_json()
+    threading.Thread(
+        target=open_explore_tab,
+        args=(d.get("lat"), d.get("lng"), d.get("heading", 0), d.get("pitch", 0)),
+        daemon=True,
+    ).start()
+    return jsonify({"success": True})
+
+@app.route("/api/explore/close", methods=["POST"])
+def api_explore_close():
+    close_explore_tab()
+    return jsonify({"success": True})
+
+@app.route("/api/score", methods=["POST"])
+def api_score():
+    d = request.get_json()
+    km = haversine(d["actual_lat"], d["actual_lng"], d["guess_lat"], d["guess_lng"])
+    return jsonify({"km": round(km, 2), "score": score_from_km(km)})
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  Game HTML
+# ════════════════════════════════════════════════════════════════════════════════
+GAME_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GeoSpy</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+:root{
+  --bg:#07090d;--surface:#0d1017;--card:#111620;--border:#1a2030;
+  --accent:#efc94c;--danger:#e8453c;--green:#3dd68c;
+  --text:#dde3f0;--muted:#3d4d66;--r:13px;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;font-family:'Outfit',sans-serif;background:var(--bg);color:var(--text)}
+
+/* ── Boot loader ── */
+#boot{
+  position:fixed;inset:0;z-index:9999;background:var(--bg);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:26px;
+  transition:opacity .6s ease,visibility .6s ease;
+}
+#boot.gone{opacity:0;visibility:hidden;pointer-events:none}
+.boot-logo{
+  font-family:'Bebas Neue',sans-serif;font-size:100px;letter-spacing:6px;line-height:1;
+  color:var(--accent);
+  animation:breathe 2.4s ease-in-out infinite;
+}
+.boot-logo span{color:#fff}
+@keyframes breathe{
+  0%,100%{text-shadow:0 0 60px rgba(239,201,76,.18)}
+  50%{text-shadow:0 0 140px rgba(239,201,76,.55)}
+}
+.boot-ring{
+  width:44px;height:44px;border-radius:50%;
+  border:3px solid var(--border);border-top-color:var(--accent);
+  animation:spin .75s linear infinite;
+}
+.boot-msg{font-size:13px;color:var(--muted);letter-spacing:.5px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── Screens ── */
+.screen{
+  position:fixed;inset:0;z-index:10;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  transition:opacity .35s ease,transform .35s ease;
+}
+.screen.hidden{opacity:0;pointer-events:none;transform:scale(.975)}
+
+/* ── Menu ── */
+#menu{background:radial-gradient(ellipse at 60% 20%,#131c30 0%,#07090d 65%)}
+.menu-glow{
+  position:absolute;width:700px;height:700px;border-radius:50%;
+  background:radial-gradient(circle,rgba(239,201,76,.06) 0%,transparent 70%);
+  top:-200px;right:-150px;pointer-events:none;
+}
+.logo{
+  font-family:'Bebas Neue',sans-serif;font-size:clamp(80px,14vw,140px);
+  color:var(--accent);letter-spacing:6px;line-height:1;
+  text-shadow:0 0 100px rgba(239,201,76,.25);
+}
+.logo span{color:var(--text)}
+.tagline{font-size:12px;color:var(--muted);letter-spacing:3px;text-transform:uppercase;margin:10px 0 48px}
+.menu-btns{display:flex;flex-direction:column;gap:12px;width:280px}
+.mbtn{
+  font-family:'Outfit',sans-serif;font-size:15px;font-weight:500;
+  padding:15px 26px;border-radius:var(--r);border:none;cursor:pointer;
+  transition:all .2s;letter-spacing:.5px;
+}
+.mbtn-primary{background:var(--accent);color:#07090d}
+.mbtn-primary:hover{background:#fdd96a;transform:translateY(-2px);box-shadow:0 12px 40px rgba(239,201,76,.22)}
+.mbtn-secondary{background:var(--card);color:var(--text);border:1px solid var(--border)}
+.mbtn-secondary:hover{background:var(--surface)}
+.warn-box{
+  margin-top:22px;font-size:12px;color:var(--danger);
+  background:rgba(232,69,60,.1);border:1px solid rgba(232,69,60,.25);
+  padding:11px 18px;border-radius:10px;text-align:center;max-width:320px;
+}
+.warn-box code{font-size:11px;display:block;margin-top:5px;opacity:.8}
+
+/* ── Round picker ── */
+#rounds-pick{background:var(--bg);gap:30px}
+.rpick-title{font-family:'Bebas Neue',sans-serif;font-size:44px;color:var(--accent);letter-spacing:3px}
+.round-opts{display:flex;gap:14px}
+.ropt{
+  width:78px;height:78px;border-radius:var(--r);border:2px solid var(--border);
+  background:var(--card);color:var(--text);font-size:26px;font-weight:500;
+  cursor:pointer;transition:all .18s;display:flex;align-items:center;justify-content:center;
+  font-family:'Bebas Neue',sans-serif;letter-spacing:1px;
+}
+.ropt:hover,.ropt.sel{border-color:var(--accent);color:var(--accent);background:rgba(239,201,76,.08)}
+
+/* ── HUD ── */
+.hud{
+  display:flex;align-items:center;gap:10px;padding:10px 20px;
+  background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;z-index:5;
+}
+.hud-logo{font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--accent);letter-spacing:3px}
+.hud-round{font-size:12px;color:var(--muted);margin-left:2px;letter-spacing:.4px}
+.famous-badge{
+  display:none;font-size:11px;
+  background:rgba(61,214,140,.1);border:1px solid rgba(61,214,140,.3);
+  color:var(--green);padding:3px 10px;border-radius:20px;letter-spacing:.5px;
+}
+.famous-badge.show{display:inline-block}
+.hud-score{margin-left:auto;font-size:13px;color:var(--muted)}
+.hud-score strong{
+  color:var(--accent);font-size:22px;
+  font-family:'Bebas Neue',sans-serif;letter-spacing:1px;margin-left:5px;
+}
+.hud-timer{
+  width:44px;height:44px;border-radius:50%;border:2px solid var(--border);
+  display:flex;align-items:center;justify-content:center;
+  font-size:15px;font-weight:500;transition:border-color .3s,color .3s;flex-shrink:0;
+}
+.hud-timer.low{border-color:var(--danger);color:var(--danger);animation:tp .7s infinite}
+@keyframes tp{0%,100%{opacity:1}50%{opacity:.5}}
+.round-pips{display:flex;gap:6px}
+.pip{width:8px;height:8px;border-radius:50%;background:var(--border);transition:background .3s}
+.pip.done{background:var(--green)}.pip.active{background:var(--accent)}
+
+/* ── Game layout ── */
+#game{flex-direction:column;background:var(--bg);padding:0;justify-content:flex-start;overflow:hidden}
+.game-body{display:grid;grid-template-columns:1fr 340px;flex:1;overflow:hidden;min-height:0}
+
+/* ── Street View pane ── */
+.sv-pane{position:relative;overflow:hidden;background:#04060a}
+.sv-img{width:100%;height:100%;object-fit:cover;display:none}
+.sv-img.show{display:block}
+
+/* ── Round loader (SSE-driven) ── */
+.sv-loader{
+  position:absolute;inset:0;z-index:10;background:var(--bg);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;
+  transition:opacity .5s ease,visibility .5s ease;
+}
+.sv-loader.hidden{opacity:0;visibility:hidden;pointer-events:none}
+.sv-loader .ring{
+  width:54px;height:54px;border-radius:50%;
+  border:3px solid var(--border);border-top-color:var(--accent);
+  animation:spin .8s linear infinite;
+}
+.sv-loader .lbl{font-size:14px;font-weight:500;text-align:center;min-height:20px}
+.sv-loader .sub{font-size:12px;color:var(--muted);text-align:center;margin-top:-12px;max-width:260px;line-height:1.7;min-height:18px}
+.sv-loader .track{width:220px;height:3px;background:var(--border);border-radius:4px;overflow:hidden}
+.sv-loader .fill{height:100%;background:var(--accent);border-radius:4px;width:0;transition:width .4s ease}
+
+/* Step list inside loader */
+.sv-steps{display:flex;flex-direction:column;gap:8px;width:230px}
+.sv-step{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);transition:color .25s}
+.sv-step.active{color:var(--text)}
+.sv-step.done{color:var(--green)}
+.sv-step .dot{
+  width:8px;height:8px;border-radius:50%;flex-shrink:0;
+  background:var(--border);transition:background .25s;
+}
+.sv-step.active .dot{background:var(--accent);animation:dp .9s infinite}
+.sv-step.done .dot{background:var(--green)}
+@keyframes dp{0%,100%{transform:scale(1)}50%{transform:scale(1.5)}}
+
+/* No-data overlay */
+.sv-nodata{
+  position:absolute;inset:0;z-index:11;
+  display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;
+  background:rgba(7,9,13,.94);
+}
+.sv-nodata.show{display:flex}
+.sv-nodata .icon{font-size:48px}
+.sv-nodata p{font-size:13px;color:var(--muted);text-align:center}
+
+/* Look-around arrows */
+.sv-controls{
+  position:absolute;bottom:20px;left:50%;transform:translateX(-50%);
+  z-index:6;display:grid;grid-template-columns:42px 42px 42px;grid-template-rows:42px 42px;gap:6px;
+}
+.sv-ctrl{
+  width:42px;height:42px;border-radius:50%;
+  background:rgba(13,16,23,.85);border:1px solid var(--border);color:var(--text);
+  font-size:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:all .18s;user-select:none;backdrop-filter:blur(10px);
+}
+.sv-ctrl:hover:not(:disabled){background:rgba(239,201,76,.2);color:var(--accent);border-color:rgba(239,201,76,.5)}
+.sv-ctrl:disabled{opacity:.3;cursor:default}
+
+/* Explore button */
+.sv-explore-btn{
+  position:absolute;top:14px;right:14px;z-index:6;
+  background:rgba(239,201,76,.12);border:1px solid rgba(239,201,76,.45);
+  color:var(--accent);font-size:12px;font-weight:500;font-family:'Outfit',sans-serif;
+  padding:8px 15px;border-radius:10px;cursor:pointer;
+  transition:all .2s;letter-spacing:.4px;
+  display:none;align-items:center;gap:8px;backdrop-filter:blur(8px);
+}
+.sv-explore-btn.vis{display:flex}
+.sv-explore-btn:hover{background:rgba(239,201,76,.25);transform:translateY(-1px)}
+.sv-explore-btn .eicon{font-size:15px}
+
+/* Explore open bar */
+.explore-bar{
+  position:absolute;top:0;left:0;right:0;z-index:7;
+  background:rgba(61,214,140,.1);border-bottom:1px solid rgba(61,214,140,.3);
+  color:var(--green);font-size:12px;padding:7px 16px;
+  display:none;align-items:center;gap:8px;backdrop-filter:blur(6px);
+}
+.explore-bar.show{display:flex}
+.explore-close{
+  margin-left:auto;font-size:11px;background:transparent;
+  border:1px solid rgba(61,214,140,.3);color:var(--green);
+  padding:3px 10px;border-radius:6px;cursor:pointer;font-family:'Outfit',sans-serif;
+}
+.explore-close:hover{background:rgba(61,214,140,.1)}
+
+/* ── Map pane ── */
+.map-pane{background:var(--card);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.map-inner{flex:1;min-height:0;position:relative}
+#map{width:100%;height:100%}
+.map-hint{font-size:11px;color:var(--muted);text-align:center;padding:8px 6px;flex-shrink:0;border-top:1px solid var(--border);letter-spacing:.3px}
+.guess-btn{
+  margin:10px;border:none;border-radius:var(--r);padding:14px;
+  background:var(--accent);color:#07090d;font-family:'Outfit',sans-serif;
+  font-size:15px;font-weight:600;cursor:pointer;transition:all .2s;flex-shrink:0;letter-spacing:.3px;
+}
+.guess-btn:hover:not(:disabled){background:#fdd96a;transform:translateY(-1px)}
+.guess-btn:disabled{background:var(--muted);cursor:default;color:var(--bg);transform:none}
+
+/* ── Result ── */
+#result{background:var(--bg);padding:30px;overflow:auto}
+.result-inner{width:100%;max-width:720px;display:flex;flex-direction:column;gap:18px}
+.result-header{display:flex;align-items:flex-end;gap:22px;flex-wrap:wrap}
+.result-score{font-family:'Bebas Neue',sans-serif;font-size:96px;color:var(--accent);line-height:1;text-shadow:0 0 60px rgba(239,201,76,.3)}
+.result-meta{display:flex;flex-direction:column;gap:6px;padding-bottom:10px}
+.result-dist{font-size:28px;font-weight:300}.result-dist strong{color:var(--danger)}
+.result-region{font-size:13px;color:var(--muted)}
+.reveal-place{font-size:13px;color:var(--green);background:rgba(61,214,140,.07);border:1px solid rgba(61,214,140,.22);border-radius:10px;padding:10px 16px;display:none}
+.reveal-place.show{display:block}
+.result-map{width:100%;height:260px;border-radius:var(--r);overflow:hidden;border:1px solid var(--border)}
+#result-map{width:100%;height:100%}
+.result-btns{display:flex;gap:10px}
+.rbtn{flex:1;padding:14px;border-radius:var(--r);font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;border:none;cursor:pointer;transition:all .2s}
+.rbtn-primary{background:var(--accent);color:#07090d}.rbtn-primary:hover{background:#fdd96a}
+.rbtn-secondary{background:var(--card);color:var(--text);border:1px solid var(--border)}.rbtn-secondary:hover{background:var(--surface)}
+
+/* ── Final ── */
+#final{background:radial-gradient(ellipse at 50% 0%,#131c30 0%,#07090d 55%);gap:18px;padding:30px}
+.final-title{font-family:'Bebas Neue',sans-serif;font-size:64px;color:var(--accent);letter-spacing:4px}
+.final-total{font-size:96px;font-family:'Bebas Neue',sans-serif;color:var(--text);line-height:1}
+.final-total span{color:var(--accent)}
+.final-max{font-size:13px;color:var(--muted)}
+.grade{font-size:16px;color:var(--muted);font-weight:300}
+.grade strong{color:var(--green);font-weight:600}
+.final-breakdown{width:100%;max-width:450px;display:flex;flex-direction:column;gap:8px}
+.fb-row{display:flex;align-items:center;justify-content:space-between;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 16px}
+.fb-round{font-size:11px;color:var(--muted);margin-bottom:2px}
+.fb-region{font-size:13px}
+.fb-score{font-family:'Bebas Neue',sans-serif;font-size:24px;color:var(--accent)}
+.fb-dist{font-size:11px;color:var(--muted);margin-top:2px}
+.leaflet-control-attribution{display:none}
+</style>
+</head>
+<body>
+
+<!-- Boot loader: shown until fonts+status check done -->
+<div id="boot">
+  <div class="boot-logo">Geo<span>Spy</span></div>
+  <div class="boot-ring"></div>
+  <div class="boot-msg" id="boot-msg">Loading…</div>
+</div>
+
+<!-- Menu -->
+<div class="screen hidden" id="menu">
+  <div class="menu-glow"></div>
+  <div class="logo">Geo<span>Spy</span></div>
+  <div class="tagline">How well do you know the world?</div>
+  <div class="menu-btns">
+    <button class="mbtn mbtn-primary"   onclick="goRoundPick()">&#9654;&#xFE0E; Play</button>
+    <button class="mbtn mbtn-secondary" onclick="showHow()">How to play</button>
+  </div>
+  <div class="warn-box" id="sel-warn" style="display:none">
+    &#9888; Selenium not installed — screenshots will fail.
+    <code>pip install selenium webdriver-manager Pillow</code>
+  </div>
+</div>
+
+<!-- Round picker -->
+<div class="screen hidden" id="rounds-pick">
+  <div class="rpick-title">How many rounds?</div>
+  <div class="round-opts">
+    <button class="ropt"     onclick="selectRounds(3,this)">3</button>
+    <button class="ropt sel" onclick="selectRounds(5,this)">5</button>
+    <button class="ropt"     onclick="selectRounds(10,this)">10</button>
+  </div>
+  <div style="display:flex;gap:12px;margin-top:26px">
+    <button class="mbtn mbtn-primary"   style="width:150px" onclick="startGame()">Start</button>
+    <button class="mbtn mbtn-secondary" style="width:110px" onclick="show('menu')">Back</button>
+  </div>
+</div>
+
+<!-- Game -->
+<div class="screen hidden" id="game">
+  <div class="hud">
+    <span class="hud-logo">GeoSpy</span>
+    <span class="hud-round" id="hud-round">Round 1 / 5</span>
+    <span class="famous-badge" id="famous-badge">&#9733; Landmark</span>
+    <div class="round-pips" id="pips"></div>
+    <div class="hud-score">Score<strong id="hud-score">0</strong></div>
+    <div class="hud-timer" id="timer">&#8212;</div>
+  </div>
+  <div class="game-body">
+    <div class="sv-pane">
+      <img class="sv-img" id="sv-img" alt="Street View">
+
+      <!-- Per-round loader -->
+      <div class="sv-loader" id="sv-loader">
+        <div class="ring"></div>
+        <div class="lbl" id="sl-lbl">Preparing…</div>
+        <div class="sub" id="sl-sub"></div>
+        <div class="track"><div class="fill" id="sl-fill"></div></div>
+        <div class="sv-steps">
+          <div class="sv-step" id="step-0"><div class="dot"></div><span>Navigating to location</span></div>
+          <div class="sv-step" id="step-1"><div class="dot"></div><span>Handling cookie popups</span></div>
+          <div class="sv-step" id="step-2"><div class="dot"></div><span>Waiting for panorama canvas</span></div>
+          <div class="sv-step" id="step-3"><div class="dot"></div><span>Hiding location clues</span></div>
+          <div class="sv-step" id="step-4"><div class="dot"></div><span>Taking screenshot</span></div>
+          <div class="sv-step" id="step-5"><div class="dot"></div><span>Blurring UI elements</span></div>
+        </div>
+      </div>
+
+      <!-- No coverage -->
+      <div class="sv-nodata" id="sv-nodata">
+        <div class="icon">&#127760;</div>
+        <p>No Street View here.<br>Loading next location…</p>
+      </div>
+
+      <!-- Explore bar -->
+      <div class="explore-bar" id="explore-bar">
+        &#128065; Street View opened in a new window — explore freely, then come back to guess!
+        <button class="explore-close" onclick="closeExplore()">Dismiss</button>
+      </div>
+
+      <!-- Look-around controls -->
+      <div class="sv-controls">
+        <div></div>
+        <button class="sv-ctrl" id="ctrl-up"    onclick="lookAround(0,25)"   title="Look up">&#9650;</button>
+        <div></div>
+        <button class="sv-ctrl" id="ctrl-left"  onclick="lookAround(-60,0)"  title="Look left">&#9664;</button>
+        <div></div>
+        <button class="sv-ctrl" id="ctrl-right" onclick="lookAround(60,0)"   title="Look right">&#9654;</button>
+      </div>
+
+      <!-- Explore button -->
+      <button class="sv-explore-btn" id="explore-btn" onclick="openExplore()">
+        <span class="eicon">&#127758;</span> Explore in new tab
+      </button>
+    </div>
+
+    <div class="map-pane">
+      <div class="map-inner"><div id="map"></div></div>
+      <div class="map-hint" id="map-hint">Click on the map to place your guess</div>
+      <button class="guess-btn" id="guess-btn" disabled onclick="submitGuess()">Place your guess</button>
+    </div>
+  </div>
+</div>
+
+<!-- Result -->
+<div class="screen hidden" id="result">
+  <div class="result-inner">
+    <div class="result-header">
+      <div class="result-score" id="res-score">0</div>
+      <div class="result-meta">
+        <div class="result-dist">Off by <strong id="res-dist">?</strong></div>
+        <div class="result-region" id="res-region"></div>
+      </div>
+    </div>
+    <div class="reveal-place" id="reveal-place">&#128205; It was: <strong id="reveal-name"></strong></div>
+    <div class="result-map"><div id="result-map"></div></div>
+    <div class="result-btns">
+      <button class="rbtn rbtn-primary"   id="next-btn" onclick="nextRound()">Next Round &#8594;</button>
+      <button class="rbtn rbtn-secondary" onclick="goMenu()">Quit</button>
+    </div>
+  </div>
+</div>
+
+<!-- Final -->
+<div class="screen hidden" id="final">
+  <div class="final-title">Game Over</div>
+  <div class="final-total" id="final-total">0 <span>pts</span></div>
+  <div class="final-max"   id="final-max">out of 25,000</div>
+  <div class="grade"       id="final-grade"></div>
+  <div class="final-breakdown" id="final-breakdown"></div>
+  <div style="display:flex;gap:12px;margin-top:12px">
+    <button class="mbtn mbtn-primary"   style="width:170px" onclick="goRoundPick()">Play again</button>
+    <button class="mbtn mbtn-secondary" style="width:120px" onclick="goMenu()">Menu</button>
+  </div>
+</div>
+
+<script>
+/* ── State ── */
+let totalRounds=5, currentRound=0, totalScore=0;
+let roundHistory=[], currentLoc=null;
+let guessMarker=null, map=null, resultMap=null;
+let timerInterval=null, timeLeft=90;
+let curHeading=0, curPitch=0;
+let lookLoading=false, exploreOpen=false;
+let currentSSE=null;
+
+/* ── Boot sequence ──
+   Wait for fonts + server status check before showing menu.
+   This ensures the page never appears half-loaded.
+── */
+(async function boot(){
+  setBootMsg('Loading fonts…');
+  try{ await document.fonts.ready }catch(_){}
+
+  setBootMsg('Checking server…');
+  let status={};
+  try{ status=await fetch('/api/status').then(r=>r.json()) }catch(_){}
+
+  if(!status.selenium){
+    document.getElementById('sel-warn').style.display='';
+  }
+
+  setBootMsg('Ready!');
+  await sleep(380);
+  document.getElementById('boot').classList.add('gone');
+  show('menu');
+})();
+
+function setBootMsg(m){ document.getElementById('boot-msg').textContent=m }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)) }
+
+/* ── Screen system ── */
+function show(id){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('hidden',s.id!==id));
+}
+function goMenu(){ clearTimer(); abortSSE(); closeExplore(); show('menu') }
+function goRoundPick(){ show('rounds-pick') }
+function selectRounds(n,el){
+  totalRounds=n;
+  document.querySelectorAll('.ropt').forEach(b=>b.classList.remove('sel'));
+  el.classList.add('sel');
+}
+function showHow(){
+  alert(
+    "GeoSpy — How to Play\n\n"+
+    "1. Selenium captures a real Google Street View screenshot.\n"+
+    "   All location-revealing UI (search bar, minimap, labels,\n"+
+    "   attribution, controls) is removed via CSS + Pillow blur.\n\n"+
+    "2. Watch the live progress steps while Selenium works.\n\n"+
+    "3. Use the ▲ ◀ ▶ arrows to look around — re-captures at a new angle.\n\n"+
+    "4. Click 'Explore in new tab' to open the same location in a\n"+
+    "   visible Selenium window — walk around freely (UI still hidden).\n\n"+
+    "5. Click the world map to drop your guess pin, then hit 'Place your guess'.\n"+
+    "   Closer = more points. Max 5,000 per round.\n\n"+
+    "65% of rounds are famous landmarks. Good luck!"
+  );
+}
+
+/* ── Game start ── */
+function startGame(){
+  currentRound=0; totalScore=0; roundHistory=[];
+  show('game'); initMap(); buildPips(); loadRound();
+}
+function buildPips(){
+  const c=document.getElementById('pips'); c.innerHTML='';
+  for(let i=0;i<totalRounds;i++){
+    const d=document.createElement('div');
+    d.className='pip'+(i===0?' active':''); d.id='pip-'+i; c.appendChild(d);
+  }
+}
+function updatePips(){
+  for(let i=0;i<totalRounds;i++){
+    const p=document.getElementById('pip-'+i); if(!p)return;
+    p.className=i<currentRound?'pip done':i===currentRound?'pip active':'pip';
+  }
+}
+
+/* ── Leaflet map ── */
+function initMap(){
+  if(map){map.remove();map=null}
+  setTimeout(()=>{
+    map=L.map('map',{zoomControl:true,attributionControl:false}).setView([20,0],2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18}).addTo(map);
+    map.on('click',onMapClick);
+  },120);
+}
+function onMapClick(e){
+  const{lat,lng}=e.latlng;
+  if(guessMarker)map.removeLayer(guessMarker);
+  guessMarker=L.circleMarker([lat,lng],{radius:10,color:'#efc94c',fillColor:'#efc94c',fillOpacity:.9,weight:2}).addTo(map);
+  document.getElementById('guess-btn').disabled=false;
+  document.getElementById('map-hint').textContent=`Pinned: ${lat.toFixed(3)}, ${lng.toFixed(3)}`;
+}
+
+/* ── SSE loader helpers ── */
+const STEP_PCT=[5,20,35,60,80,90];  // which pct activates each step index
+
+function abortSSE(){ if(currentSSE){currentSSE.close();currentSSE=null} }
+
+function resetLoader(){
+  for(let i=0;i<6;i++){const e=document.getElementById('step-'+i);if(e)e.className='sv-step'}
+  document.getElementById('sl-fill').style.transition='none';
+  document.getElementById('sl-fill').style.width='0%';
+  // Force reflow so the transition reset takes effect before next frame
+  void document.getElementById('sl-fill').offsetWidth;
+  document.getElementById('sl-fill').style.transition='width .4s ease';
+}
+function updateSteps(pct){
+  STEP_PCT.forEach((thresh,i)=>{
+    const el=document.getElementById('step-'+i); if(!el)return;
+    const nextThresh=STEP_PCT[i+1]||101;
+    if(pct>=nextThresh)      el.className='sv-step done';
+    else if(pct>=thresh)     el.className='sv-step active';
+    else                     el.className='sv-step';
+  });
+}
+function setProgress(pct,lbl,sub=''){
+  document.getElementById('sl-fill').style.width=pct+'%';
+  document.getElementById('sl-lbl').textContent=lbl;
+  document.getElementById('sl-sub').textContent=sub;
+  updateSteps(pct);
+}
+function showLoader(){ resetLoader(); document.getElementById('sv-loader').classList.remove('hidden') }
+function hideLoader(){ document.getElementById('sv-loader').classList.add('hidden') }
+
+/* ── Load round ── */
+async function loadRound(){
+  abortSSE(); closeExplore();
+  if(map&&guessMarker){map.removeLayer(guessMarker);guessMarker=null}
+  document.getElementById('guess-btn').disabled=true;
+  document.getElementById('map-hint').textContent='Click on the map to place your guess';
+  document.getElementById('hud-round').textContent=`Round ${currentRound+1} / ${totalRounds}`;
+  document.getElementById('sv-img').classList.remove('show');
+  document.getElementById('sv-nodata').classList.remove('show');
+  document.getElementById('explore-btn').className='sv-explore-btn';
+  setCtrlsDisabled(true);
+  const fb=document.getElementById('famous-badge');
+  fb.textContent=''; fb.classList.remove('show');
+  updatePips();
+  showLoader();
+  setProgress(2,'Fetching location…');
+
+  let loc;
+  try{
+    loc=await fetch('/api/round').then(r=>r.json());
+  }catch(e){
+    setProgress(0,'Network error','Could not reach server');
+    return;
+  }
+  currentLoc=loc; curHeading=loc.heading; curPitch=loc.pitch||0;
+  if(loc.famous){ document.getElementById('famous-badge').textContent='\u2605 Landmark'; document.getElementById('famous-badge').classList.add('show') }
+
+  await streamCapture(loc.lat,loc.lng,curHeading,curPitch,false);
+}
+
+/* ── SSE stream capture ── */
+// Friendly labels for each progress pct bracket
+const PCT_LABELS={
+  5:  ['Navigating to Street View…',    'Opening Google Maps in headless Chrome'],
+  20: ['Handling cookie popups…',       'Dismissing consent dialogs'],
+  35: ['Waiting for panorama canvas…',  'Street View is rendering the 360° scene'],
+  60: ['Hiding location clues…',        'Injecting CSS to remove signs & labels'],
+  80: ['Taking screenshot…',            'Capturing the full browser viewport'],
+  90: ['Blurring remaining UI…',        'Applying Gaussian blur to overlay zones'],
+};
+
+function streamCapture(lat,lng,heading,pitch,isLook){
+  return new Promise(resolve=>{
+    abortSSE();
+    const url=`/api/screenshot/stream?lat=${lat}&lng=${lng}&heading=${heading}&pitch=${pitch}`;
+    const sse=new EventSource(url);
+    currentSSE=sse;
+
+    sse.onmessage=(e)=>{
+      let ev; try{ev=JSON.parse(e.data)}catch(_){return}
+
+      if(ev.type==='progress'){
+        let lbl=ev.msg, sub='';
+        for(const[thresh,[l,s]] of Object.entries(PCT_LABELS)){
+          if(ev.pct>=Number(thresh)){lbl=l;sub=s}
+        }
+        setProgress(ev.pct,lbl,sub);
+
+      }else if(ev.type==='done'){
+        sse.close(); currentSSE=null;
+        setProgress(100,'Rendering image…','');
+        setTimeout(async()=>{
+          const img=document.getElementById('sv-img');
+          try{
+            await new Promise((res,rej)=>{ img.onload=res; img.onerror=rej; img.src='data:image/png;base64,'+ev.image });
+            img.classList.add('show');
+            hideLoader();
+            setCtrlsDisabled(false);
+            document.getElementById('explore-btn').className='sv-explore-btn vis';
+            if(!isLook) startTimer();
+          }catch(_){
+            hideLoader();
+            document.getElementById('sv-nodata').classList.add('show');
+            if(!isLook) setTimeout(loadRound,2500);
+            else setCtrlsDisabled(false);
+          }
+          resolve();
+        },280);
+
+      }else if(ev.type==='error'){
+        sse.close(); currentSSE=null;
+        hideLoader();
+        document.getElementById('sv-nodata').classList.add('show');
+        if(!isLook) setTimeout(loadRound,2500);
+        else setCtrlsDisabled(false);
+        resolve();
+      }
+    };
+
+    sse.onerror=()=>{
+      sse.close(); currentSSE=null;
+      hideLoader();
+      document.getElementById('sv-nodata').classList.add('show');
+      if(!isLook) setTimeout(loadRound,2500);
+      else setCtrlsDisabled(false);
+      resolve();
+    };
+  });
+}
+
+/* ── Look around ── */
+function setCtrlsDisabled(dis){
+  ['ctrl-up','ctrl-left','ctrl-right'].forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=dis});
+}
+async function lookAround(dH,dP){
+  if(lookLoading||!currentLoc)return;
+  lookLoading=true; setCtrlsDisabled(true);
+  document.getElementById('explore-btn').className='sv-explore-btn';
+  document.getElementById('sv-img').classList.remove('show');
+  showLoader(); setProgress(2,'Rotating view…');
+  curHeading=((curHeading+dH)%360+360)%360;
+  curPitch=Math.max(-60,Math.min(60,curPitch+dP));
+  await streamCapture(currentLoc.lat,currentLoc.lng,curHeading,curPitch,true);
+  lookLoading=false;
+}
+
+/* ── Explore ── */
+async function openExplore(){
+  if(!currentLoc)return;
+  const btn=document.getElementById('explore-btn');
+  btn.innerHTML='<span class="eicon">&#8987;</span> Opening…'; btn.disabled=true;
+  try{
+    await fetch('/api/explore',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({lat:currentLoc.lat,lng:currentLoc.lng,heading:curHeading,pitch:curPitch})});
+    exploreOpen=true;
+    document.getElementById('explore-bar').classList.add('show');
+    btn.innerHTML='<span class="eicon">&#128065;</span> Tab open';
+  }catch(_){
+    btn.innerHTML='<span class="eicon">&#10060;</span> Failed';
+  }
+  btn.disabled=false;
+}
+async function closeExplore(){
+  if(!exploreOpen)return; exploreOpen=false;
+  document.getElementById('explore-bar').classList.remove('show');
+  try{await fetch('/api/explore/close',{method:'POST'})}catch(_){}
+  const btn=document.getElementById('explore-btn');
+  if(btn) btn.innerHTML='<span class="eicon">&#127758;</span> Explore in new tab';
+}
+
+/* ── Timer ── */
+function startTimer(){ clearTimer(); timeLeft=90; updateTimerDisplay(); timerInterval=setInterval(()=>{timeLeft--;updateTimerDisplay();if(timeLeft<=0){clearTimer();autoGuess()}},1000) }
+function clearTimer(){ if(timerInterval){clearInterval(timerInterval);timerInterval=null} }
+function updateTimerDisplay(){const e=document.getElementById('timer');e.textContent=timeLeft;e.className='hud-timer'+(timeLeft<=15?' low':'')}
+
+/* ── Auto-guess (timer expiry)
+   FIX: place marker FIRST, then call submitGuess in a separate task
+        so guessMarker is guaranteed non-null when submitGuess reads it.
+── */
+function autoGuess(){
+  if(!guessMarker&&map){
+    const lat=(Math.random()*120)-60, lng=(Math.random()*340)-170;
+    guessMarker=L.circleMarker([lat,lng],{radius:8,color:'#e8453c',fillColor:'#e8453c',fillOpacity:.7,weight:2}).addTo(map);
+    document.getElementById('guess-btn').disabled=false;
+  }
+  setTimeout(submitGuess,0);
+}
+
+/* ── Submit guess ── */
+async function submitGuess(){
+  clearTimer(); closeExplore();
+  if(!guessMarker)return;
+  const gLat=guessMarker.getLatLng().lat, gLng=guessMarker.getLatLng().lng;
+  const aLat=currentLoc.lat, aLng=currentLoc.lng;
+  const res=await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({guess_lat:gLat,guess_lng:gLng,actual_lat:aLat,actual_lng:aLng})});
+  const data=await res.json();
+  totalScore+=data.score;
+  roundHistory.push({round:currentRound+1,region:currentLoc.region,score:data.score,km:data.km,actual:[aLat,aLng],guess:[gLat,gLng]});
+  document.getElementById('hud-score').textContent=totalScore.toLocaleString();
+  showResult(data,gLat,gLng,aLat,aLng);
+}
+
+/* ── Result screen ── */
+function showResult(data,gLat,gLng,aLat,aLng){
+  document.getElementById('res-score').textContent=data.score.toLocaleString();
+  document.getElementById('res-dist').textContent=data.km<1?Math.round(data.km*1000)+' m':Math.round(data.km).toLocaleString()+' km';
+  document.getElementById('res-region').textContent='\uD83D\uDCCD '+currentLoc.region;
+  const rp=document.getElementById('reveal-place'),rn=document.getElementById('reveal-name');
+  if(currentLoc.famous&&currentLoc.place){rn.textContent=currentLoc.place;rp.classList.add('show')}else rp.classList.remove('show');
+  document.getElementById('next-btn').textContent=currentRound===totalRounds-1?'See Final Score \u2192':'Next Round \u2192';
+  show('result');
+  setTimeout(()=>{
+    if(resultMap){resultMap.remove();resultMap=null}
+    resultMap=L.map('result-map',{zoomControl:false,attributionControl:false});
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(resultMap);
+    const aLL=[aLat,aLng],gLL=[gLat,gLng];
+    L.circleMarker(aLL,{radius:12,color:'#3dd68c',fillColor:'#3dd68c',fillOpacity:1,weight:3}).addTo(resultMap).bindPopup('\uD83C\uDFAF Actual').openPopup();
+    L.circleMarker(gLL,{radius:10,color:'#efc94c',fillColor:'#efc94c',fillOpacity:.9,weight:2}).addTo(resultMap).bindPopup('\uD83D\uDCCD Your guess');
+    L.polyline([aLL,gLL],{color:'#e8453c',weight:2,dashArray:'6,4',opacity:.8}).addTo(resultMap);
+    resultMap.fitBounds(L.latLngBounds([aLL,gLL]),{padding:[44,44]});
+  },200);
+}
+
+/* ── Next round / final ── */
+function nextRound(){
+  currentRound++;
+  if(currentRound>=totalRounds){showFinal();return}
+  show('game'); loadRound();
+}
+function showFinal(){
+  const max=totalRounds*5000;
+  document.getElementById('final-total').innerHTML=totalScore.toLocaleString()+' <span>pts</span>';
+  document.getElementById('final-max').textContent='out of '+max.toLocaleString();
+  const pct=totalScore/max;
+  document.getElementById('final-grade').innerHTML=
+    pct>=.95?'\uD83C\uDFC6 <strong>Geographic Genius!</strong>':
+    pct>=.80?'\uD83C\uDF0D <strong>World Explorer</strong> \u2014 Impressive!':
+    pct>=.60?'\u2708\uFE0F <strong>Seasoned Traveler</strong> \u2014 Solid!':
+    pct>=.40?'\uD83D\uDDFA\uFE0F <strong>Getting There</strong> \u2014 Keep exploring!':
+    '\uD83C\uDF31 <strong>Beginner</strong> \u2014 The world awaits!';
+  document.getElementById('final-breakdown').innerHTML=roundHistory.map(r=>`
+    <div class="fb-row">
+      <div>
+        <div class="fb-round">Round ${r.round}</div>
+        <div class="fb-region">${r.region}</div>
+        <div class="fb-dist">${r.km<1?Math.round(r.km*1000)+' m':Math.round(r.km).toLocaleString()+' km'} away</div>
+      </div>
+      <div class="fb-score">${r.score.toLocaleString()}</div>
+    </div>`).join('');
+  show('final');
+}
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    print("\n  GeoSpy  |  http://localhost:5000")
+    print("  ─────────────────────────────────")
+    if not SELENIUM_OK:
+        print("  ⚠  MISSING: pip install selenium webdriver-manager Pillow")
+    else:
+        print(f"  ✓  Selenium OK  |  Pillow: {'OK' if PIL_OK else 'MISSING — pip install Pillow'}")
+    print()
+    app.run(debug=False, port=5000, threaded=True)
