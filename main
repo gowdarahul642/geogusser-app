@@ -1,6 +1,6 @@
 """
 GeoSpy — GeoGuessr-style game (Selenium edition, fully fixed)
-=============================================================
+====================================================================
 
 Key improvements over original:
   • PERSISTENT headless driver — created once, reused every round (~3x faster)
